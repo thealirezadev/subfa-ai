@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import sys
 from datetime import datetime
@@ -40,6 +41,12 @@ VIDEO_COST     = 5
 INVITER_COINS  = 5
 INVITEE_COINS  = 3
 
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# jobs worksheet column indices (1-based, matches the header row below)
+COL_STATUS = 5
+COL_EMAIL  = 10
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Check your .env file.")
 if not WEBHOOK_URL:
@@ -58,15 +65,29 @@ sheet = gc.open(SHEET_NAME)
 try:
     users_ws = sheet.worksheet(USERS_SHEET)
 except gspread.WorksheetNotFound:
-    users_ws = sheet.add_worksheet(title=USERS_SHEET, rows="1000", cols="6")
-    users_ws.append_row(["chat_id", "username", "coins", "invite_code", "inviter_id", "join_date"])
+    users_ws = sheet.add_worksheet(title=USERS_SHEET, rows="1000", cols="7")
+    users_ws.append_row(["chat_id", "username", "coins", "invite_code", "inviter_id",
+                          "join_date", "last_email"])
 
 try:
     jobs_ws = sheet.worksheet(JOBS_SHEET)
 except gspread.WorksheetNotFound:
-    jobs_ws = sheet.add_worksheet(title=JOBS_SHEET, rows="1000", cols="9")
+    jobs_ws = sheet.add_worksheet(title=JOBS_SHEET, rows="1000", cols="10")
     jobs_ws.append_row(["job_id", "chat_id", "message_id", "file_id", "status",
-                         "video_path", "srt_path", "output_path", "created_at"])
+                         "video_path", "srt_path", "output_path", "created_at", "email"])
+
+
+def _ensure_header_column(ws, column_name):
+    """Make sure `column_name` exists in the worksheet header (for sheets created
+    before this feature existed). Appends it as a new last column if missing."""
+    header = ws.row_values(1)
+    if column_name not in header:
+        ws.update_cell(1, len(header) + 1, column_name)
+        logging.info(f"MIGRATION: added missing '{column_name}' column to '{ws.title}'")
+
+
+_ensure_header_column(users_ws, "last_email")
+_ensure_header_column(jobs_ws, "email")
 
 # ─────────────────────────── Bot & App ───────────────────────────
 
@@ -101,6 +122,7 @@ def add_user(chat_id, username, inviter_id=None):
         new_invite_code,
         str(inviter_id) if inviter_id else "",
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "",
     ])
     logging.info(
         f"ADD_USER: chat_id={chat_id} username={username} "
@@ -135,6 +157,41 @@ def find_inviter(invite_code):
         if str(u.get("invite_code", "")) == str(invite_code):
             return str(u["chat_id"])
     return None
+
+
+def is_valid_email(text):
+    return bool(EMAIL_REGEX.match((text or "").strip()))
+
+
+def get_pending_email_job(chat_id):
+    """Return (job_dict, row_index) for the most recent job of this user that is
+    still waiting for an email, or None if there isn't one."""
+    all_jobs = jobs_ws.get_all_records()
+    pending = [
+        (i, j) for i, j in enumerate(all_jobs)
+        if str(j["chat_id"]) == str(chat_id) and j["status"] == "awaiting_email"
+    ]
+    if not pending:
+        return None
+    idx, job = pending[-1]
+    row_idx = idx + 2  # +1 for header row, +1 because gspread rows are 1-indexed
+    return job, row_idx
+
+
+def save_job_email(row_idx, email):
+    jobs_ws.update_cell(row_idx, COL_EMAIL, email)
+    jobs_ws.update_cell(row_idx, COL_STATUS, "new")
+
+
+def save_last_email(chat_id, email):
+    cell = users_ws.find(str(chat_id), in_column=1)
+    if cell:
+        users_ws.update_cell(cell.row, 7, email)
+
+
+def get_last_email(chat_id):
+    user = get_user(chat_id)
+    return (user.get("last_email") or "").strip() if user else ""
 
 
 def is_member(channel, user_id):
@@ -302,7 +359,7 @@ def history(message):
         return
     text = "📋 **آخرین پردازش‌های تو:**\n\n"
     for j in user_jobs[-5:]:
-        status_emoji = {"done": "✅", "processing": "⏳", "new": "🆕"}.get(j["status"], "❓")
+        status_emoji = {"done": "✅", "processing": "⏳", "new": "🆕", "awaiting_email": "📧"}.get(j["status"], "❓")
         text += f"{status_emoji} `{j['created_at']}` → {j['status']}\n"
     bot.send_message(chat_id, text, parse_mode="Markdown")
 
@@ -351,6 +408,15 @@ def video_handler(message):
     if not user or int(user["coins"]) < VIDEO_COST:
         bot.send_message(chat_id, "⛔️ سکه کافی نیست.")
         return
+
+    if get_pending_email_job(chat_id):
+        bot.send_message(
+            chat_id,
+            "⏳ یک ویدیوی قبلی شما منتظر دریافت ایمیله. "
+            "لطفاً اول ایمیل خودتون رو برای اون ویدیو بفرستید، بعد ویدیوی جدید رو ارسال کنید.",
+        )
+        return
+
     success, new_coins = deduct_coins(chat_id, VIDEO_COST)
     if not success:
         bot.send_message(chat_id, "خطا در کسر سکه.")
@@ -360,17 +426,97 @@ def video_handler(message):
         job_id = int(datetime.now().timestamp())
         jobs_ws.append_row([
             job_id, str(chat_id), message.message_id, message.video.file_id,
-            "new", "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "awaiting_email", "", "", "", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "",
         ])
     except Exception as e:
         logging.error(f"jobs append FAILED: {e}")
         bot.send_message(chat_id, "خطا در ثبت ویدیو")
         return
+
     bot.send_message(
         chat_id,
-        f"✅ **ویدیو با موفقیت ثبت شد!**\n"
-        f"🎬 در حال آماده‌سازی زیرنویس...\n"
+        f"✅ **ویدیو با موفقیت دریافت شد!**\n"
         f"💰 **سکه باقی‌مونده:** `{new_coins}`",
+        parse_mode="Markdown",
+    )
+
+    last_email = get_last_email(chat_id)
+    if last_email:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            f"📧 استفاده از {last_email}", callback_data="use_last_email",
+        ))
+        bot.send_message(
+            chat_id,
+            "📧 **ایمیلتون رو بفرستید** تا وقتی ویدیو آماده شد، یک نوتیفیکیشن هم به ایمیلتون ارسال بشه.\n"
+            "یا روی دکمه زیر بزنید تا از ایمیل قبلی استفاده بشه:",
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            "📧 **ایمیلتون رو بفرستید** تا وقتی ویدیو آماده شد و براتون ارسال شد، "
+            "یک نوتیفیکیشن هم به ایمیلتون ارسال بشه.\n"
+            "(مثال: `example@gmail.com`)",
+            parse_mode="Markdown",
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "use_last_email")
+def use_last_email_callback(call):
+    chat_id = call.message.chat.id
+    pending = get_pending_email_job(chat_id)
+    if not pending:
+        bot.answer_callback_query(call.id, "❌ ویدیویی در انتظار ایمیل پیدا نشد.", show_alert=True)
+        return
+
+    job, row_idx = pending
+    last_email = get_last_email(chat_id)
+    if not last_email:
+        bot.answer_callback_query(call.id, "❌ ایمیل قبلی پیدا نشد.", show_alert=True)
+        return
+
+    save_job_email(row_idx, last_email)
+    bot.answer_callback_query(call.id, "✅ ثبت شد!")
+    bot.send_message(
+        chat_id,
+        f"✅ ایمیل `{last_email}` برای این ویدیو ثبت شد.\n🎬 پردازش ویدیوی شما شروع شد!",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def email_collector_handler(message):
+    """Catch-all text handler — runs only if no earlier handler matched the
+    message (e.g. menu buttons). Used to collect the user's email right after
+    they send a video."""
+    chat_id = message.chat.id
+    text    = (message.text or "").strip()
+
+    if text.startswith("/"):
+        return  # unknown command — ignore
+
+    pending = get_pending_email_job(chat_id)
+    if not pending:
+        return  # nothing waiting on this user, nothing to do
+
+    job, row_idx = pending
+
+    if not is_valid_email(text):
+        bot.send_message(
+            chat_id,
+            "⚠️ این یک ایمیل معتبر به نظر نمیاد. لطفاً یک ایمیل درست بفرستید "
+            "(مثال: `example@gmail.com`)",
+            parse_mode="Markdown",
+        )
+        return
+
+    save_job_email(row_idx, text)
+    save_last_email(chat_id, text)
+    bot.send_message(
+        chat_id,
+        f"✅ ایمیل `{text}` برای این ویدیو ثبت شد.\n🎬 پردازش ویدیوی شما شروع شد!",
         parse_mode="Markdown",
     )
 
