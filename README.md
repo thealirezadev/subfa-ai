@@ -15,6 +15,7 @@ A Telegram bot that automatically generates Persian (Farsi) subtitles for user-u
 - 📊 Job tracking via **Google Sheets**
 - 🔗 Invite link system (inviter +5 coins, invitee +3 coins)
 - 🔒 Channel membership gate
+- 📧 Email notification — after sending a video, the user is asked for their email; once the finished video is delivered on Telegram, an email is also sent letting them know it's ready
 
 ---
 
@@ -45,7 +46,7 @@ User sends video via Telegram
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/subfa-ai.git
+git clone https://github.com/thealirezadev/subfa-ai
 cd subfa-ai
 pip install -r requirements.txt
 ```
@@ -109,6 +110,19 @@ subfa-ai/
 ├── .gitignore
 └── README.md
 ```
+
+---
+
+## 📧 Email Notification Flow
+
+1. User sends a video → coins are deducted and the job is saved with status `awaiting_email`.
+2. The bot asks the user for their email (or offers a button to reuse the last email they gave).
+3. Once a valid email is received, the job status moves to `new` and enters the normal pipeline.
+4. In **Stage 5** of the Colab pipeline, right after the finished video is sent on Telegram (status → `completed`), an email is sent to the user's address letting them know the video is ready.
+
+This requires `SMTP_SERVER`, `SMTP_PORT`, `EMAIL_SENDER`, and `EMAIL_PASSWORD` to be set as **Colab Secrets** (see `.env.example` for a Gmail example — you'll need a Gmail **App Password**, not your normal password). If these aren't set, Stage 5 just skips the email step and logs why.
+
+> ⚠️ If you already have a live `subtitle_jobs` Google Sheet from before this feature, the bot will automatically add the missing `email` / `last_email` columns to the `jobs` and `users` worksheets the first time it starts up.
 
 ---
 
